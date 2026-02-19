@@ -17,6 +17,10 @@ AP_NETWORK="${AP_IP}/24"
 DHCP_START="192.168.42.100"
 DHCP_END="192.168.42.150"
 
+# Virtuelle Umgebung Einstellungen
+VENV_DIR="/opt/mitmproxy_venv" # Verzeichnis für die virtuelle Umgebung
+MITMPROXY_EXEC="${VENV_DIR}/bin/mitmweb" # Pfad zur mitmweb-Ausführungsdatei in der venv
+
 # Funktion für Statusmeldungen
 log_status() {
     echo -e "${GREEN}### STATUS: ${1} ###${NC}"
@@ -34,29 +38,36 @@ log_error() {
 }
 
 # 1. System aktualisieren und notwendige Pakete installieren
-log_status "Aktualisiere System und installiere notwendige Pakete (hostapd, dnsmasq, python3-pip)..."
+log_status "Aktualisiere System und installiere notwendige Pakete (hostapd, dnsmasq, python3-venv)..."
 sudo apt update && sudo apt upgrade -y || log_error "System-Update fehlgeschlagen."
-sudo apt install -y python3 python3-pip git dialog hostapd dnsmasq netfilter-persistent iptables-persistent || log_error "Paketinstallation fehlgeschlagen."
+# Sicherstellen, dass python3-venv installiert ist für virtuelle Umgebungen
+sudo apt install -y python3 python3-pip python3-venv git dialog hostapd dnsmasq netfilter-persistent iptables-persistent || log_error "Paketinstallation fehlgeschlagen."
 
-# 2. mitmproxy installieren
-log_status "Installiere mitmproxy via pip..."
-pip3 install mitmproxy || log_error "mitmproxy Installation fehlgeschlagen."
+# 2. mitmproxy in einer virtuellen Umgebung installieren
+log_status "Erstelle virtuelle Umgebung für mitmproxy..."
+sudo mkdir -p "$VENV_DIR" || log_error "Konnte Verzeichnis für virtuelle Umgebung nicht erstellen."
+sudo python3 -m venv "$VENV_DIR" || log_error "Erstellung der virtuellen Umgebung fehlgeschlagen."
+
+log_status "Installiere mitmproxy in der virtuellen Umgebung..."
+# Sicherstellen, dass pip in der venv aktualisiert ist
+sudo "$VENV_DIR"/bin/pip install --upgrade pip || log_error "Aktualisierung von pip in venv fehlgeschlagen."
+# mitmproxy installieren
+sudo "$VENV_DIR"/bin/pip install mitmproxy || log_error "mitmproxy Installation in virtueller Umgebung fehlgeschlagen."
 
 # 3. Netzwerkkonfiguration für den Access Point
 log_status "Konfiguriere Netzwerkschnittstellen für den Access Point..."
 
 # DHCPCD für WLAN-Schnittstelle deaktivieren, falls aktiv
+log_status "Deaktiviere dhcpcd für ${AP_INTERFACE}..."
+if grep -q "nohook wpa_supplicant" /etc/dhcpcd.conf; then
+    log_warning "Eintrag für ${AP_INTERFACE} in dhcpcd.conf existiert bereits, überspringe das Hinzufügen."
+else
+    echo "interface $AP_INTERFACE" | sudo tee -a /etc/dhcpcd.conf > /dev/null
+    echo "    static ip_address=$AP_NETWORK" | sudo tee -a /etc/dhcpcd.conf > /dev/null
+    echo "    nohook wpa_supplicant" | sudo tee -a /etc/dhcpcd.conf > /dev/null
+fi
 sudo systemctl stop dhcpcd || log_warning "dhcpcd konnte nicht gestoppt werden (möglicherweise nicht aktiv)."
 sudo systemctl disable dhcpcd || log_warning "dhcpcd konnte nicht deaktiviert werden (möglicherweise nicht aktiv)."
-
-# Konfiguriere statische IP für die WLAN-Schnittstelle
-echo "interface $AP_INTERFACE" | sudo tee /etc/dhcpcd.conf > /dev/null
-echo "    static ip_address=$AP_NETWORK" | sudo tee -a /etc/dhcpcd.conf > /dev/null
-echo "    nohook wpa_supplicant" | sudo tee -a /etc/dhcpcd.conf > /dev/null
-
-# Alte Konfiguration von /etc/network/interfaces wiederherstellen (falls nötig)
-# In neueren Raspbian-Versionen wird dhcpcd für WLAN verwendet, interfaces nur für Ethernet/Loopback.
-# Dies sollte aber nicht stören, solange dhcpcd für wlan0 deaktiviert wird.
 
 # IPv4-Forwarding aktivieren
 log_status "Aktiviere IPv4-Forwarding..."
@@ -99,7 +110,6 @@ interface=$AP_INTERFACE
 dhcp-range=$DHCP_START,$DHCP_END,255.255.255.0,24h
 dhcp-option=option:router,$AP_IP
 dhcp-option=option:dns-server,$AP_IP # Verwende den Pi selbst als DNS-Server (für mitmproxy DNS Interception)
-# dhcp-option=option:dns-server,8.8.8.8,8.8.4.4 # Alternativ externe DNS-Server
 listen-address=$AP_IP
 EOF
 sudo systemctl enable dnsmasq || log_error "dnsmasq konnte nicht aktiviert werden."
@@ -152,7 +162,7 @@ Description=Mitmweb Proxy
 After=network.target
 
 [Service]
-ExecStart=/usr/local/bin/mitmweb --mode transparent --web-host 0.0.0.0 --web-port 8081 --listen-host $AP_IP --listen-port 8080
+ExecStart=$MITMPROXY_EXEC --mode transparent --web-host 0.0.0.0 --web-port 8081 --listen-host $AP_IP --listen-port 8080
 Restart=always
 User=pi # Ersetzen Sie 'pi' durch den gewünschten Benutzer
 Group=pi # Ersetzen Sie 'pi' durch die gewünschte Gruppe
@@ -166,6 +176,8 @@ sudo systemctl enable mitmweb || log_error "mitmweb Service konnte nicht aktivie
 
 # 8. Services starten und Status überprüfen
 log_status "Starte hostapd, dnsmasq und mitmweb Services..."
+# Stoppe die Services zuerst, falls sie bereits liefen und neu konfiguriert wurden
+sudo systemctl stop hostapd dnsmasq mitmweb &>/dev/null
 sudo systemctl start hostapd || log_error "hostapd konnte nicht gestartet werden."
 sudo systemctl start dnsmasq || log_error "dnsmasq konnte nicht gestartet werden."
 sudo systemctl start mitmweb || log_error "mitmweb konnte nicht gestartet werden."
